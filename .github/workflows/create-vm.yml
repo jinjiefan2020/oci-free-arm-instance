@@ -73,10 +73,10 @@ jobs:
           # Check the log content for an error string.
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
             echo "Success! 'PROVISIONING' state found in output."
-            exit 0
+            exit 1
           else
             echo "Error: Success string not found in OCI output. Failing the step."
-            exit 1
+            exit 0
           fi
 
       - name: Send Discord Notification
