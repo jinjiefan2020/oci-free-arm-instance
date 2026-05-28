@@ -6,6 +6,7 @@ on:
   # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
