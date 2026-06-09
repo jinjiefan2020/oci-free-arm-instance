@@ -51,7 +51,7 @@ jobs:
       - name: Try to create VM (每10分钟重试，最多30次≈5小时)
         id: create_vm
         run: |
-          MAX_ATTEMPTS=1
+          MAX_ATTEMPTS=30
           INTERVAL=600
           VM_CREATED=false
           LAST_LOG=""
