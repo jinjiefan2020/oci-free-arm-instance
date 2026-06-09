@@ -120,7 +120,7 @@ jobs:
           status: failure
           color: 0xffc107
           description: |
-            30次尝试（约5小时）均无可用容量，将在下次触发时继续。
+            30次尝试Montreal（约5小时）均无可用容量，将在下次触发时继续。
             **Last OCI response:**
             ```json
             ${{ steps.create_vm.outputs.log_data }}
