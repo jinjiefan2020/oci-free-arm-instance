@@ -2,8 +2,12 @@ name: Try to Create OCI VM
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每6小时触发一次，job 内部循环每10分钟重试
+    - cron: "0 */6 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: oci-a1-free-tier-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
@@ -15,10 +19,13 @@ env:
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  VM_NAME: coolify-vm
 
 jobs:
   create-oci-vm:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
+
     steps:
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -48,12 +55,36 @@ jobs:
 
           printf '%s' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
-      - name: Try to create VM (每10分钟重试，最多30次≈5小时)
+      - name: Check if VM already exists
+        id: check_existing
+        shell: bash
+        run: |
+          EXISTING_JSON=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --availability-domain "$AD_NAME" \
+            --display-name "$VM_NAME" \
+            --output json)
+
+          EXISTING_ID=$(echo "$EXISTING_JSON" | jq -r '.data[0].id // empty')
+          EXISTING_STATE=$(echo "$EXISTING_JSON" | jq -r '.data[0]."lifecycle-state" // empty')
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$EXISTING_ID" >> "$GITHUB_OUTPUT"
+            echo "instance_state=$EXISTING_STATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Try to create VM
         id: create_vm
+        if: steps.check_existing.outputs.exists != 'true'
+        shell: bash
         run: |
           MAX_ATTEMPTS=30
           INTERVAL=600
           VM_CREATED=false
+          INSTANCE_ID=""
           LAST_LOG=""
 
           for i in $(seq 1 $MAX_ATTEMPTS); do
@@ -68,18 +99,21 @@ jobs:
               --image-id "$IMAGE_ID" \
               --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
               --assign-public-ip true \
-              --display-name "coolify-vm" \
-              --boot-volume-size-in-gbs 200 2>&1 || true)
+              --display-name "$VM_NAME" \
+              --boot-volume-size-in-gbs 200 \
+              --output json 2>&1 || true)
 
-            if echo "$LAST_LOG" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            INSTANCE_ID=$(echo "$LAST_LOG" | jq -r '.data.id // empty' 2>/dev/null || true)
+            LIFECYCLE=$(echo "$LAST_LOG" | jq -r '.data."lifecycle-state" // empty' 2>/dev/null || true)
+
+            if [ -n "$INSTANCE_ID" ] && [ "$LIFECYCLE" = "PROVISIONING" ]; then
               echo "Success! VM is PROVISIONING."
               VM_CREATED=true
               break
             fi
 
-            # 打印关键错误信息便于日志排查
             echo "No capacity yet. OCI response snippet:"
-            echo "$LAST_LOG" | grep -iE '"message"|"code"|"status"' | head -3 || echo "$LAST_LOG" | head -3
+            echo "$LAST_LOG" | grep -iE '"message"|"code"|"status"' | head -3 || echo "$LAST_LOG" | head -20
 
             if [ $i -lt $MAX_ATTEMPTS ]; then
               echo "Waiting ${INTERVAL}s before next attempt..."
@@ -89,39 +123,52 @@ jobs:
 
           {
             echo "vm_created=$VM_CREATED"
+            echo "instance_id=$INSTANCE_ID"
             echo "log_data<<LOGEOF"
             echo "$LAST_LOG"
             echo "LOGEOF"
           } >> "$GITHUB_OUTPUT"
 
-          # 没抢到不是 workflow 错误，始终 exit 0
           exit 0
 
-      - name: Notify Discord — VM Created (Success)
+      - name: Notify Discord — Already Exists
+        if: steps.check_existing.outputs.exists == 'true'
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI VM already exists"
+          color: 0x17a2b8
+          status: success
+          description: |
+            已检测到同名实例，跳过创建。
+            **Instance ID:** `${{ steps.check_existing.outputs.instance_id }}`
+            **State:** `${{ steps.check_existing.outputs.instance_state }}`
+
+      - name: Notify Discord — VM Created
         if: steps.create_vm.outputs.vm_created == 'true'
         uses: sarisia/actions-status-discord@v1.15.4
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           title: "OCI A1.Flex VM Created!"
-          status: success
           color: 0x28a745
+          status: success
           description: |
             VM is now **PROVISIONING**.
+            **Instance ID:** `${{ steps.create_vm.outputs.instance_id }}`
             ```json
             ${{ steps.create_vm.outputs.log_data }}
             ```
 
-      - name: Notify Discord — No Capacity (Still Waiting)
-        if: steps.create_vm.outputs.vm_created == 'false'
+      - name: Notify Discord — No Capacity
+        if: steps.check_existing.outputs.exists != 'true' && steps.create_vm.outputs.vm_created == 'false'
         uses: sarisia/actions-status-discord@v1.15.4
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           title: "OCI VM: No capacity after 30 attempts"
-          status: failure
           color: 0xffc107
+          status: failure
           description: |
-            30次尝试Montreal（约5小时）均无可用容量，将在下次触发时继续。
-            **Last OCI response:**
+            30 次尝试后仍无可用容量，下次 schedule 会继续。
             ```json
             ${{ steps.create_vm.outputs.log_data }}
             ```
