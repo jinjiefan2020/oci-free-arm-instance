@@ -27,37 +27,174 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      # ... (你之前的所有步骤保持不变) ...
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
 
-  # 新增：专门处理被取消的通知
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install and configure OCI CLI
+        run: |
+          pip install oci-cli
+
+          mkdir -p ~/.oci
+          printf '%s' "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          key_file=$HOME/.oci/oci_api_key.pem
+          region=${{ env.OCI_CLI_REGION }}
+          EOF
+
+          printf '%s' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+
+      - name: Check if VM already exists
+        id: check_existing
+        shell: bash
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+          EXISTING_JSON=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --availability-domain "$AD_NAME" \
+            --display-name "$VM_NAME" \
+            --output json 2>/dev/null) || EXISTING_JSON=""
+
+          if [ -z "$EXISTING_JSON" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EXISTING_ID=$(echo "$EXISTING_JSON" | jq -r '.data[0].id // empty')
+          EXISTING_STATE=$(echo "$EXISTING_JSON" | jq -r '.data[0]."lifecycle-state" // empty')
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$EXISTING_ID" >> "$GITHUB_OUTPUT"
+            echo "instance_state=$EXISTING_STATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Try to create VM
+        id: create_vm
+        if: steps.check_existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+          MAX_ATTEMPTS=30
+          INTERVAL=600
+          VM_CREATED=false
+          INSTANCE_ID=""
+          LAST_LOG=""
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Attempt $i / $MAX_ATTEMPTS ==="
+
+            LAST_LOG=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "$VM_NAME" \
+              --boot-volume-size-in-gbs 200 \
+              --output json 2>&1) || LAST_LOG=""
+
+            if [ -n "$LAST_LOG" ]; then
+              INSTANCE_ID=$(echo "$LAST_LOG" | jq -r '.id // empty' 2>/dev/null) || INSTANCE_ID=""
+              LIFECYCLE=$(echo "$LAST_LOG" | jq -r '."lifecycle-state" // empty' 2>/dev/null) || LIFECYCLE=""
+            fi
+
+            if [ -n "$INSTANCE_ID" ] && [ "$LIFECYCLE" = "PROVISIONING" ]; then
+              echo "Success! VM is PROVISIONING."
+              VM_CREATED=true
+              break
+            fi
+
+            echo "No capacity yet. OCI response snippet:"
+            echo "$LAST_LOG" | grep -iE '"message"|"code"|"status"' | head -3 || echo "$LAST_LOG" | head -5
+
+            if [ $i -lt $MAX_ATTEMPTS ]; then
+              echo "Waiting ${INTERVAL}s before next attempt..."
+              sleep $INTERVAL
+            fi
+          done
+
+          {
+            echo "vm_created=$VM_CREATED"
+            echo "instance_id=$INSTANCE_ID"
+            echo "log_data<<LOGEOF"
+            echo "$LAST_LOG"
+            echo "LOGEOF"
+          } >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: Notify Discord — Already Exists
+        if: steps.check_existing.outputs.exists == 'true'
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI VM already exists"
+          color: 0x17a2b8
+          status: success
+          description: |
+            VM 已存在，跳过创建。
+            **Instance ID:** `${{ steps.check_existing.outputs.instance_id }}`
+            **State:** `${{ steps.check_existing.outputs.instance_state }}`
+
+      - name: Notify Discord — VM Created
+        if: steps.create_vm.outputs.vm_created == 'true'
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI A1.Flex VM Created!"
+          color: 0x28a745
+          status: success
+          description: |
+            VM 正在 **PROVISIONING**。
+            **Instance ID:** `${{ steps.create_vm.outputs.instance_id }}`
+
+      - name: Notify Discord — No Capacity
+        if: steps.check_existing.outputs.exists != 'true' && steps.create_vm.outputs.vm_created == 'false'
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI VM: No capacity after 30 attempts"
+          color: 0xffc107
+          status: failure
+          description: 30 次尝试后仍无可用容量，下次 schedule 会继续。
+
   notify-cancel:
     runs-on: ubuntu-latest
     needs: create-oci-vm
     if: cancelled()
     steps:
       - name: Notify Discord — Job Cancelled
-        uses: nobrayner/discord-webhook@v1
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          discord-webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          title: "⚠️ OCI VM Scrapper Cancelled"
-          color-cancelled: '0x42daf5'
-          description: |
-            这个工作流被新的定时调度取消了（这是正常的换班行为）。
-            **新任务会自动继续运行，不会丢失进度。**
-            ```
-            Workflow: ${{ github.workflow }}
-            Run ID: ${{ github.run_id }}
-            Cancelled at: ${{ github.event.workflow_run.cancelled_at }}
-            ```
-
-      - name: Notify Sarisia — Job Cancelled (备选)
-        if: false  # 如果上面那个不行，用这个替代
-        uses: sarisia/actions-status-discord@v1
+        uses: sarisia/actions-status-discord@v1.15.4
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          title: "⚠️ OCI VM Scrapper Cancelled"
-          status: failure
+          title: "⚠️ OCI VM Scrapper Cancelled (正常换班)"
           color: 0x42daf5
+          status: failure
           description: |
-            工作流被 concurrency 规则取消了（正常换班）。新任务会继续。
+            工作流被 `concurrency` 取消（这是正常的换班行为）。
+            **新任务会自动继续，不会丢失进度。**
+            Workflow: ${{ github.workflow }}
+            Run ID: ${{ github.run_id }}
