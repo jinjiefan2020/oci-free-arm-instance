@@ -107,13 +107,13 @@ jobs:
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD_NAME" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":3,"memoryInGBs":16}' \
+              --shape-config '{"ocpus":2,"memoryInGBs":8}' \
               --subnet-id "$SUBNET_ID" \
               --image-id "$IMAGE_ID" \
               --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
               --assign-public-ip true \
               --display-name "$VM_NAME" \
-              --boot-volume-size-in-gbs 200 \
+              --boot-volume-size-in-gbs 160 \
               --output json 2>&1) || LAST_LOG=""
 
             if [ -n "$LAST_LOG" ]; then
