@@ -95,7 +95,7 @@ jobs:
           fi
 
           MAX_ATTEMPTS=30
-          INTERVAL=600
+          INTERVAL=1000
           VM_CREATED=false
           INSTANCE_ID=""
           LAST_LOG=""
@@ -107,7 +107,7 @@ jobs:
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD_NAME" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":4}' \
+              --shape-config '{"ocpus":1,"memoryInGBs":5}' \
               --subnet-id "$SUBNET_ID" \
               --image-id "$IMAGE_ID" \
               --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
